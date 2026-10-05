@@ -1,0 +1,40 @@
+# Compose for the TAR attestation service.
+#
+# Services:
+#   web     long-running API; host port is configurable via TAR_PORT
+#           (default 8080):  TAR_PORT=9000 docker compose up --build
+#   verify  one-shot job: byte-compile, full pytest suite, then smoke
+#           test a valid bundle, a bad-checksum bundle and a path
+#           conflict against a booted server. Result is reported via
+#           the container exit code (0 = pass, 1 = fail).
+#
+# Run:
+#   docker compose up --build            # serve
+#   docker compose run --rm verify       # one-shot verification
+#   TAR_PORT=9000 docker compose up      # custom host port
+
+services:
+  web:
+    build: .
+    image: tar-attest:latest
+    ports:
+      - "${TAR_PORT:-8080}:8080"
+    environment:
+      PORT: "8080"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import http.client,sys; r=http.client.HTTPConnection('127.0.0.1',8080); r.request('GET','/health'); sys.exit(0 if r.getresponse().status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+    restart: unless-stopped
+
+  verify:
+    build: .
+    image: tar-attest:latest
+    # One-shot: reports pass/fail via exit code, never restarts.
+    command: ["python", "scripts/verify.py"]
+    environment:
+      VERIFY_PORT: "8099"
+    restart: "no"
