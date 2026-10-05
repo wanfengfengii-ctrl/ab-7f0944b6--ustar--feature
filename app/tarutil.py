@@ -22,6 +22,10 @@ MAX_CONTENT_BYTES = 6 * 1024 * 1024
 MAX_ENTRIES = 100
 MIN_ENTRIES = 1
 
+# Pre-registered manifest member: exactly one must be present when an
+# X-Bundle-Manifest-Sha256 header accompanies the request.
+MANIFEST_PATH = b"BUNDLE.MANIFEST"
+
 # Header field offsets (POSIX ustar).
 NAME = (0, 100)
 MODE = (100, 108)
@@ -50,18 +54,24 @@ class TarError(Exception):
 
     ``entry`` is the 1-based ordinal of the header being parsed (when
     known) so a rejected submission can be traced to a specific member.
+    ``line`` is set instead for declaration-file errors located by
+    manifest line number.
     """
 
-    def __init__(self, category: str, message: str, entry: int | None = None):
+    def __init__(self, category: str, message: str, entry: int | None = None,
+                 line: int | None = None):
         super().__init__(message)
         self.category = category
         self.message = message
         self.entry = entry
+        self.line = line
 
     def to_dict(self) -> dict:
         body = {"category": self.category, "message": self.message}
         if self.entry is not None:
             body["entry"] = self.entry
+        if self.line is not None:
+            body["line"] = self.line
         return body
 
 
@@ -70,6 +80,7 @@ class Entry:
     path: bytes  # NFC UTF-8 bytes
     size: int
     digest: bytes  # raw SHA-256 of the file content
+    content: bytes | None = None  # retained only for explicitly captured members
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +304,13 @@ def parse_archive(data: bytes) -> list[Entry]:
             )
 
         entries.append(
-            Entry(path=raw_path, size=size, digest=hashlib.sha256(content).digest())
+            Entry(
+                path=raw_path,
+                size=size,
+                digest=hashlib.sha256(content).digest(),
+                # Only the declaration file's bytes are ever needed again.
+                content=content if raw_path == MANIFEST_PATH else None,
+            )
         )
         pos = pad_end
     else:  # pragma: no cover - loop always ends via break or raise
@@ -305,13 +322,211 @@ def parse_archive(data: bytes) -> list[Entry]:
 
 
 # ---------------------------------------------------------------------------
+# Declaration file (BUNDLE.MANIFEST)
+# ---------------------------------------------------------------------------
+
+
+# ASCII printable, no tab (field separator); the path grammar is vetted
+# separately with validate_path-equivalent rules.
+_HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
+_DECIMAL_SIZE = re.compile(r"(?:0|[1-9][0-9]*)")
+
+
+def _valid_declared_path(raw: bytes) -> bool:
+    if not raw or raw == MANIFEST_PATH:
+        return False
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return False
+    if text.startswith("/") or "\\" in text:
+        return False
+    for segment in text.split("/"):
+        if segment in ("", ".", ".."):
+            return False
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in segment):
+            return False
+    return True
+
+
+def parse_manifest(raw: bytes) -> list[tuple[bytes, int, bytes]]:
+    """Parse declaration bytes into ``(path, size, raw_digest)`` tuples.
+
+    Format: ASCII text, one member per line; each line holds the
+    lowercase-hex SHA-256 digest, a tab, the canonical decimal size, a
+    tab and the path, terminated by a single LF.  Paths are strictly
+    increasing by UTF-8 byte order.  Any deviation raises
+    :class:`TarError` with ``category="bad_manifest"`` and a 1-based
+    ``line`` number.
+    """
+    # Every line, including the last, must end with LF; a trailing LF is
+    # therefore a terminator rather than an extra blank line.  Work in
+    # bytes first so the line number survives a non-ASCII byte.  An
+    # empty file declares zero members (a bundle holding only the
+    # manifest itself).
+    if raw == b"":
+        return []
+    if not raw.endswith(b"\n"):
+        line = raw.count(b"\n") + 1
+        raise TarError(
+            "bad_manifest", "manifest line is not terminated by LF", line=line
+        )
+    lines = raw.split(b"\n")[:-1]
+
+    declared: list[tuple[bytes, int, bytes]] = []
+    previous: bytes | None = None
+    for line_no, line in enumerate(lines, start=1):
+        try:
+            text = line.decode("ascii")
+        except UnicodeDecodeError:
+            raise TarError(
+                "bad_manifest", "manifest line is not ASCII text",
+                line=line_no,
+            )
+        if not text:
+            raise TarError(
+                "bad_manifest", "empty manifest line", line=line_no
+            )
+        # The only separators are the two tabs; embedded tabs anywhere
+        # (digest/size/path) must not be silently split on.
+        parts = text.split("\t")
+        if len(parts) != 3:
+            raise TarError(
+                "bad_manifest",
+                "manifest line must be '<sha256>\\t<size>\\t<path>'",
+                line=line_no,
+            )
+        digest_hex, size_text, path_text = parts
+
+        if not _HEX_DIGEST.fullmatch(digest_hex):
+            raise TarError(
+                "bad_manifest",
+                "manifest digest must be 64 lowercase hex characters",
+                line=line_no,
+            )
+        if not _DECIMAL_SIZE.fullmatch(size_text):
+            raise TarError(
+                "bad_manifest",
+                "manifest size must be canonical decimal digits",
+                line=line_no,
+            )
+        path_raw = path_text.encode("ascii")
+        if not _valid_declared_path(path_raw):
+            raise TarError(
+                "bad_manifest", "manifest path is not a valid relative path",
+                line=line_no,
+            )
+        if previous is not None and not (previous < path_raw):
+            raise TarError(
+                "bad_manifest",
+                "manifest paths are not strictly increasing by UTF-8 bytes",
+                line=line_no,
+            )
+
+        declared.append((path_raw, int(size_text), bytes.fromhex(digest_hex)))
+        previous = path_raw
+    return declared
+
+
+def verify_manifest(entries: list[Entry], manifest_bytes: bytes) -> None:
+    """Compare a parsed archive against its declaration file.
+
+    Covers exactly the members other than ``BUNDLE.MANIFEST``: a missing
+    member, an extra member or any size/digest mismatch fails with a
+    conflict category and no partial manifest is returned.
+    """
+    declared = parse_manifest(manifest_bytes)
+    actual = {e.path: e for e in entries if e.path != MANIFEST_PATH}
+    declared_paths = [path for path, _size, _digest in declared]
+
+    if len(declared_paths) != len(set(declared_paths)):
+        # Strictly increasing order already rejects this; kept defensive.
+        raise TarError(
+            "manifest_conflict", "manifest lists the same path more than once"
+        )
+
+    declared_set = set(declared_paths)
+    actual_set = set(actual)
+
+    extra = actual_set - declared_set
+    if extra:
+        raise TarError(
+            "manifest_conflict",
+            f"bundle contains member not listed in manifest: "
+            f"{sorted(extra)[0].decode('utf-8', 'replace')}",
+        )
+
+    missing = declared_set - actual_set
+    if missing:
+        raise TarError(
+            "manifest_conflict",
+            f"manifest lists member absent from bundle: "
+            f"{sorted(missing)[0].decode('utf-8', 'replace')}",
+        )
+
+    for path, size, digest in declared:
+        entry = actual[path]
+        if entry.size != size:
+            raise TarError(
+                "manifest_conflict",
+                f"declared size {size} does not match actual size "
+                f"{entry.size} for {path.decode('utf-8', 'replace')}",
+            )
+        if entry.digest != digest:
+            raise TarError(
+                "manifest_conflict",
+                f"declared digest does not match content of "
+                f"{path.decode('utf-8', 'replace')}",
+            )
+
+
+# ---------------------------------------------------------------------------
 # Attestation
 # ---------------------------------------------------------------------------
 
 
-def attest(data: bytes) -> dict:
-    """Parse *data* and return the bytewise-sorted manifest and bundle digest."""
+def attest(data: bytes, expected_manifest_sha256: str | None = None) -> dict:
+    """Parse *data* and return the bytewise-sorted manifest and bundle digest.
+
+    When *expected_manifest_sha256* is given, the archive must contain
+    exactly one ``BUNDLE.MANIFEST`` member whose raw bytes hash to that
+    value; that check runs first, after which every declared line is
+    compared against the actual members.  Either phase failing raises
+    :class:`TarError` without producing a partial manifest.
+    """
     entries = parse_archive(data)
+
+    manifest_sha256: str | None = None
+    if expected_manifest_sha256 is not None:
+        manifests = [e for e in entries if e.path == MANIFEST_PATH]
+        if len(manifests) == 0:
+            raise TarError(
+                "manifest_conflict",
+                "bundle must contain exactly one BUNDLE.MANIFEST member; "
+                "none found",
+            )
+        if len(manifests) > 1:
+            # Duplicate paths are already rejected during parsing, so
+            # this is defensive only.
+            raise TarError(
+                "manifest_conflict",
+                "bundle contains more than one BUNDLE.MANIFEST member",
+            )
+        manifest_entry = manifests[0]
+        manifest_bytes = manifest_entry.content
+        assert manifest_bytes is not None
+        actual_manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+        # Check the pre-registered digest of the raw declaration bytes
+        # before trusting anything the declaration says.
+        if actual_manifest_digest != expected_manifest_sha256:
+            raise TarError(
+                "manifest_digest_mismatch",
+                "BUNDLE.MANIFEST sha256 does not match "
+                "X-Bundle-Manifest-Sha256",
+            )
+        verify_manifest(entries, manifest_bytes)
+        manifest_sha256 = actual_manifest_digest
+
     ordered = sorted(entries, key=lambda e: e.path)
 
     bundle_hash = hashlib.sha256()
@@ -329,7 +544,10 @@ def attest(data: bytes) -> dict:
             }
         )
 
-    return {
+    result = {
         "bundleSha256": bundle_hash.hexdigest(),
         "entries": manifest,
     }
+    if manifest_sha256 is not None:
+        result["manifestSha256"] = manifest_sha256
+    return result

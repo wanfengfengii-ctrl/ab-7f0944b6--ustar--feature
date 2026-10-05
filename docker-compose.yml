@@ -4,9 +4,12 @@
 #   web     long-running API; host port is configurable via TAR_PORT
 #           (default 8080):  TAR_PORT=9000 docker compose up --build
 #   verify  one-shot job: byte-compile, full pytest suite, then smoke
-#           test a valid bundle, a bad-checksum bundle and a path
-#           conflict against a booted server. Result is reported via
-#           the container exit code (0 = pass, 1 = fail).
+#           test a valid bundle, a bad-checksum bundle, a path
+#           conflict and the BUNDLE.MANIFEST declaration flows
+#           (compatible request, valid declaration, pre-registered
+#           digest mismatch, content digest mismatch, omitted member)
+#           against a booted server. Result is reported via the
+#           container exit code (0 = pass, 1 = fail).
 #
 # Run:
 #   docker compose up --build            # serve

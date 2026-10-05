@@ -8,6 +8,11 @@ Steps, each of which must pass:
        - a valid bundle                       -> 200 + correct bundleSha256
        - a header with a corrupted checksum   -> 422 bad_checksum
        - two members sharing one path         -> 409 duplicate_path
+       - a request without the manifest header (backwards compatibility)
+       - a bundle carrying a valid BUNDLE.MANIFEST -> 200 + manifestSha256
+       - a wrong pre-registered manifest digest    -> 409 digest mismatch
+       - a wrong per-member content digest         -> 409 manifest_conflict
+       - a manifest that omits a bundle member     -> 409 manifest_conflict
 
 Exits 0 only when everything passes; the first failure is reported and
 the process exits 1.
@@ -72,16 +77,31 @@ def wait_for_health(port: int, timeout: float = 10.0) -> None:
     fail("server boot", f"never became healthy ({last})")
 
 
-def post(port: int, payload: bytes):
+def post(port: int, payload: bytes, headers: dict | None = None):
+    hdrs = {"Content-Type": "application/x-tar"}
+    if headers:
+        hdrs.update(headers)
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-    conn.request(
-        "POST", "/api/bundles/attest", body=payload,
-        headers={"Content-Type": "application/x-tar"},
-    )
+    conn.request("POST", "/api/bundles/attest", body=payload, headers=hdrs)
     resp = conn.getresponse()
     body = resp.read()
     conn.close()
     return resp.status, json.loads(body)
+
+
+MANIFEST_HEADER = "X-Bundle-Manifest-Sha256"
+
+
+def manifest_text(files: list[tuple[bytes, bytes]]) -> bytes:
+    """Build a canonical declaration for *files* (sorted by path bytes)."""
+    lines = []
+    for name, content in sorted(files):
+        lines.append(
+            hashlib.sha256(content).hexdigest().encode("ascii")
+            + b"\t" + str(len(content)).encode("ascii")
+            + b"\t" + name
+        )
+    return b"\n".join(lines) + b"\n"
 
 
 def main() -> None:
@@ -140,6 +160,98 @@ def main() -> None:
         if "entries" in doc:
             fail("path conflict", "partial manifest leaked into error response")
         print("OK  409 category=duplicate_path entry=2", flush=True)
+
+        # --- backwards compatibility: no manifest header -----------------
+        step("smoke: compatible request without manifest header")
+        files = [(b"readme.txt", b"hello\n"), (b"dir/data.bin", b"\x00\x01\x02")]
+        decl = manifest_text(files)
+        compatible = archive(
+            *(file_member(n, c) for n, c in files),
+            file_member(b"BUNDLE.MANIFEST", decl),
+        )
+        status, doc = post(PORT, compatible)
+        if status != 200:
+            fail("compatible request", f"expected 200, got {status}: {doc}")
+        if "manifestSha256" in doc:
+            fail("compatible request",
+                 "manifestSha256 must be absent when the header is omitted")
+        print("OK  200 no manifestSha256 field (legacy contract)", flush=True)
+
+        # --- valid declared bundle ---------------------------------------
+        step("smoke: valid BUNDLE.MANIFEST declaration")
+        files = [(b"readme.txt", b"hello\n"), (b"dir/data.bin", b"\x00\x01\x02")]
+        decl = manifest_text(files)
+        declared = archive(
+            *(file_member(n, c) for n, c in files),
+            file_member(b"BUNDLE.MANIFEST", decl),
+        )
+        decl_digest = hashlib.sha256(decl).hexdigest()
+        status, doc = post(PORT, declared,
+                           headers={MANIFEST_HEADER: decl_digest})
+        if status != 200:
+            fail("valid declaration", f"expected 200, got {status}: {doc}")
+        if doc.get("manifestSha256") != decl_digest:
+            fail("valid declaration",
+                 f"manifestSha256 mismatch: {doc.get('manifestSha256')}")
+        print(f"OK  200 manifestSha256={decl_digest}", flush=True)
+
+        # --- pre-registered digest does not match ------------------------
+        step("smoke: pre-registered manifest digest mismatch")
+        status, doc = post(PORT, declared,
+                           headers={MANIFEST_HEADER: "0" * 64})
+        if (status != 409 or doc.get("error", {}).get("category")
+                != "manifest_digest_mismatch"):
+            fail("digest mismatch",
+                 f"expected 409 manifest_digest_mismatch, got {status}: {doc}")
+        if "entries" in doc:
+            fail("digest mismatch",
+                 "partial manifest leaked into error response")
+        print("OK  409 category=manifest_digest_mismatch", flush=True)
+
+        # --- declared content digest does not match the member ----------
+        step("smoke: declared content digest mismatch")
+        files = [(b"readme.txt", b"hello\n")]
+        bad_decl = (hashlib.sha256(b"goodbye\n").hexdigest().encode("ascii")
+                    + b"\t6\treadme.txt\n")
+        bad_digest_bundle = archive(
+            file_member(b"readme.txt", b"hello\n"),
+            file_member(b"BUNDLE.MANIFEST", bad_decl),
+        )
+        status, doc = post(
+            PORT, bad_digest_bundle,
+            headers={MANIFEST_HEADER: hashlib.sha256(bad_decl).hexdigest()},
+        )
+        if (status != 409 or doc.get("error", {}).get("category")
+                != "manifest_conflict"):
+            fail("content digest mismatch",
+                 f"expected 409 manifest_conflict, got {status}: {doc}")
+        if "entries" in doc:
+            fail("content digest mismatch",
+                 "partial manifest leaked into error response")
+        print("OK  409 category=manifest_conflict (content digest)", flush=True)
+
+        # --- declaration omits a member actually in the bundle -----------
+        step("smoke: manifest omits bundle member")
+        incomplete = manifest_text([(b"readme.txt", b"hello\n")])
+        omitted = archive(
+            file_member(b"readme.txt", b"hello\n"),
+            file_member(b"dir/data.bin", b"\x00\x01\x02"),
+            file_member(b"BUNDLE.MANIFEST", incomplete),
+        )
+        status, doc = post(
+            PORT, omitted,
+            headers={MANIFEST_HEADER: hashlib.sha256(incomplete).hexdigest()},
+        )
+        if (status != 409 or doc.get("error", {}).get("category")
+                != "manifest_conflict"):
+            fail("manifest omission",
+                 f"expected 409 manifest_conflict, got {status}: {doc}")
+        if "entries" in doc:
+            fail("manifest omission",
+                 "partial manifest leaked into error response")
+        if "dir/data.bin" not in doc.get("error", {}).get("message", ""):
+            fail("manifest omission", "conflict message does not name member")
+        print("OK  409 category=manifest_conflict (unlisted member)", flush=True)
     finally:
         server.terminate()
         try:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -19,6 +20,8 @@ from .tarutil import MAX_BUNDLE_BYTES, TarError, attest
 HEALTH_PATH = "/health"
 ATTEST_PATH = "/api/bundles/attest"
 TAR_CONTENT_TYPE = "application/x-tar"
+MANIFEST_DIGEST_HEADER = "X-Bundle-Manifest-Sha256"
+_LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 # Category -> HTTP status.  Nothing here ever returns a partial manifest.
 _STATUS_FOR_CATEGORY = {
@@ -35,6 +38,9 @@ _STATUS_FOR_CATEGORY = {
     "trailing_data": HTTPStatus.UNPROCESSABLE_ENTITY,
     "invalid_path": HTTPStatus.UNPROCESSABLE_ENTITY,
     "too_many_entries": HTTPStatus.UNPROCESSABLE_ENTITY,
+    "bad_manifest": HTTPStatus.UNPROCESSABLE_ENTITY,
+    "manifest_conflict": HTTPStatus.CONFLICT,
+    "manifest_digest_mismatch": HTTPStatus.CONFLICT,
     "duplicate_path": HTTPStatus.CONFLICT,
     "unsupported_media_type": HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
 }
@@ -58,17 +64,19 @@ class AttestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_error(self, status: int, category: str, message: str,
-                    entry: int | None = None) -> None:
+                    entry: int | None = None, line: int | None = None) -> None:
         err = {"category": category, "message": message}
         if entry is not None:
             err["entry"] = entry
+        if line is not None:
+            err["line"] = line
         self._send_json(status, {"error": err})
 
     def _send_tar_error(self, exc: TarError) -> None:
         status = _STATUS_FOR_CATEGORY.get(
             exc.category, HTTPStatus.UNPROCESSABLE_ENTITY
         )
-        self._send_error(status, exc.category, exc.message, exc.entry)
+        self._send_error(status, exc.category, exc.message, exc.entry, exc.line)
 
     # -- routing -----------------------------------------------------------
 
@@ -132,6 +140,20 @@ class AttestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # Optional pre-registered digest of the in-bundle declaration
+        # file.  Absent: the original contract applies unchanged.
+        manifest_header = self.headers.get(MANIFEST_DIGEST_HEADER)
+        expected_manifest_sha256: str | None = None
+        if manifest_header is not None:
+            expected_manifest_sha256 = manifest_header.strip()
+            if not _LOWERCASE_SHA256.fullmatch(expected_manifest_sha256):
+                self._send_error(
+                    HTTPStatus.BAD_REQUEST, "bad_request",
+                    f"{MANIFEST_DIGEST_HEADER} must be a lowercase "
+                    "hex SHA-256 digest (64 characters)",
+                )
+                return
+
         try:
             length = int(self.headers.get("Content-Length", "-1"))
         except ValueError:
@@ -161,7 +183,7 @@ class AttestHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = attest(data)
+            result = attest(data, expected_manifest_sha256)
         except TarError as exc:
             self._send_tar_error(exc)
             return
