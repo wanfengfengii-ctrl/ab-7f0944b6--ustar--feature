@@ -11,14 +11,22 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .tarutil import MAX_BUNDLE_BYTES, TarError, attest
+from .tarutil import (
+    MAX_BUNDLE_BYTES,
+    ManifestError,
+    TarError,
+    attest,
+)
 
 HEALTH_PATH = "/health"
 ATTEST_PATH = "/api/bundles/attest"
 TAR_CONTENT_TYPE = "application/x-tar"
+MANIFEST_HEADER = "X-Bundle-Manifest-Sha256"
+_SHA256_LOWER = re.compile(r"[0-9a-f]{64}")
 
 # Category -> HTTP status.  Nothing here ever returns a partial manifest.
 _STATUS_FOR_CATEGORY = {
@@ -37,6 +45,15 @@ _STATUS_FOR_CATEGORY = {
     "too_many_entries": HTTPStatus.UNPROCESSABLE_ENTITY,
     "duplicate_path": HTTPStatus.CONFLICT,
     "unsupported_media_type": HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+    # BUNDLE.MANIFEST declaration failures.
+    "malformed_manifest": HTTPStatus.UNPROCESSABLE_ENTITY,
+    "manifest_unsorted": HTTPStatus.UNPROCESSABLE_ENTITY,
+    "manifest_duplicate": HTTPStatus.UNPROCESSABLE_ENTITY,
+    "manifest_digest_mismatch": HTTPStatus.CONFLICT,
+    "manifest_digest_item_mismatch": HTTPStatus.CONFLICT,
+    "manifest_size_mismatch": HTTPStatus.CONFLICT,
+    "manifest_missing": HTTPStatus.CONFLICT,
+    "manifest_extra": HTTPStatus.CONFLICT,
 }
 
 
@@ -58,10 +75,16 @@ class AttestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_error(self, status: int, category: str, message: str,
-                    entry: int | None = None) -> None:
+                    entry: int | None = None,
+                    line: int | None = None,
+                    path: str | None = None) -> None:
         err = {"category": category, "message": message}
         if entry is not None:
             err["entry"] = entry
+        if line is not None:
+            err["line"] = line
+        if path is not None:
+            err["path"] = path
         self._send_json(status, {"error": err})
 
     def _send_tar_error(self, exc: TarError) -> None:
@@ -69,6 +92,14 @@ class AttestHandler(BaseHTTPRequestHandler):
             exc.category, HTTPStatus.UNPROCESSABLE_ENTITY
         )
         self._send_error(status, exc.category, exc.message, exc.entry)
+
+    def _send_manifest_error(self, exc: ManifestError) -> None:
+        status = _STATUS_FOR_CATEGORY.get(
+            exc.category, HTTPStatus.UNPROCESSABLE_ENTITY
+        )
+        self._send_error(
+            status, exc.category, exc.message, line=exc.line, path=exc.path
+        )
 
     # -- routing -----------------------------------------------------------
 
@@ -160,10 +191,32 @@ class AttestHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
 
+        # Optional pre-registration pin: exactly 64 lowercase hex chars.
+        header_values = self.headers.get_all(MANIFEST_HEADER) or []
+        manifest_sha256: str | None = None
+        if len(header_values) > 1:
+            self._send_error(
+                HTTPStatus.BAD_REQUEST, "bad_request",
+                f"{MANIFEST_HEADER} must be given at most once",
+            )
+            return
+        if header_values:
+            value = header_values[0]
+            if not _SHA256_LOWER.fullmatch(value):
+                self._send_error(
+                    HTTPStatus.BAD_REQUEST, "bad_request",
+                    f"{MANIFEST_HEADER} must be 64 lowercase hex characters",
+                )
+                return
+            manifest_sha256 = value
+
         try:
-            result = attest(data)
+            result = attest(data, manifest_sha256=manifest_sha256)
         except TarError as exc:
             self._send_tar_error(exc)
+            return
+        except ManifestError as exc:
+            self._send_manifest_error(exc)
             return
         self._send_json(HTTPStatus.OK, result)
 

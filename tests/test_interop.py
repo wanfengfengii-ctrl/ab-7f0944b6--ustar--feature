@@ -75,6 +75,27 @@ def test_prefix_field_roundtrips_long_paths():
     assert result["entries"][0]["path"] == name
 
 
+def test_tarfile_bundle_with_manifest_is_accepted():
+    # A real producer writes the declaration with the standard library;
+    # the declared raw bytes (and their digest) must survive untouched.
+    import hashlib as _hashlib
+
+    files = {"etc/app.conf": b"k=v\n", "readme": b"hi"}
+    lines = "".join(
+        f"{_hashlib.sha256(content).hexdigest()}\t{len(content)}\t{path}\n"
+        for path, content in sorted(files.items())
+    ).encode("ascii")
+    blob = _tarfile_archive(
+        {**files, "BUNDLE.MANIFEST": lines}, tarfile.USTAR_FORMAT
+    )
+    declared = _hashlib.sha256(lines).hexdigest()
+    result = attest(blob, manifest_sha256=declared)
+    assert result["manifestSha256"] == declared
+    assert [e["path"] for e in result["entries"]] == [
+        "BUNDLE.MANIFEST", "etc/app.conf", "readme",
+    ]
+
+
 @pytest.mark.skipif(shutil.which("tar") is None, reason="no system tar")
 def test_gnu_tar_output_accepted(tmp_path):
     src = tmp_path / "src"

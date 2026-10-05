@@ -22,6 +22,10 @@ MAX_CONTENT_BYTES = 6 * 1024 * 1024
 MAX_ENTRIES = 100
 MIN_ENTRIES = 1
 
+# The in-bundle declaration file.  When X-Bundle-Manifest-Sha256 is sent
+# the archive must contain exactly one member under this path.
+MANIFEST_PATH = b"BUNDLE.MANIFEST"
+
 # Header field offsets (POSIX ustar).
 NAME = (0, 100)
 MODE = (100, 108)
@@ -65,11 +69,37 @@ class TarError(Exception):
         return body
 
 
+class ManifestError(Exception):
+    """A BUNDLE.MANIFEST declaration that cannot be parsed or does not
+    match the archive.
+
+    ``line`` is the 1-based line number for format errors; ``path`` is
+    the offending member path (decoded text) for conflict errors.
+    """
+
+    def __init__(self, category: str, message: str,
+                 line: int | None = None, path: str | None = None):
+        super().__init__(message)
+        self.category = category
+        self.message = message
+        self.line = line
+        self.path = path
+
+    def to_dict(self) -> dict:
+        body = {"category": self.category, "message": self.message}
+        if self.line is not None:
+            body["line"] = self.line
+        if self.path is not None:
+            body["path"] = self.path
+        return body
+
+
 @dataclass(frozen=True)
 class Entry:
     path: bytes  # NFC UTF-8 bytes
     size: int
     digest: bytes  # raw SHA-256 of the file content
+    content_offset: int = -1  # byte offset of the content inside the archive
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +323,9 @@ def parse_archive(data: bytes) -> list[Entry]:
             )
 
         entries.append(
-            Entry(path=raw_path, size=size, digest=hashlib.sha256(content).digest())
+            Entry(path=raw_path, size=size,
+                  digest=hashlib.sha256(content).digest(),
+                  content_offset=data_start)
         )
         pos = pad_end
     else:  # pragma: no cover - loop always ends via break or raise
@@ -305,14 +337,219 @@ def parse_archive(data: bytes) -> list[Entry]:
 
 
 # ---------------------------------------------------------------------------
+# Manifest declaration
+# ---------------------------------------------------------------------------
+
+# One declared member: "<sha256 hex>\t<decimal size>\t<path>\n".
+# Digests are lowercase hex (64 chars), sizes canonical decimal (no
+# sign/spaces/leading zeroes, "0" allowed), paths are exactly the
+# NFC UTF-8 bytes accepted by validate_path (no tab, LF or CR in them).
+_MANIFEST_LINE = re.compile(rb"([0-9a-f]{64})\t(0|[1-9][0-9]*)\t([^\t\n\r]*)\n")
+
+_MANIFEST_TEXT_LIMIT = MAX_BUNDLE_BYTES
+
+
+def build_manifest_bytes(entries: list[Entry]) -> bytes:
+    """Serialise *entries* (already UTF-8 byte sorted, manifest excluded)
+    into the canonical declaration text."""
+    out = bytearray()
+    for entry in entries:
+        out.extend(entry.digest.hex().encode("ascii"))
+        out.append(0x09)
+        out.extend(str(entry.size).encode("ascii"))
+        out.append(0x09)
+        out.extend(entry.path)
+        out.append(0x0A)
+    return bytes(out)
+
+
+def parse_manifest(data: bytes) -> list[tuple[bytes, int, bytes]]:
+    """Parse declaration text into ``(path, size, raw_digest)`` rows.
+
+    Raises :class:`ManifestError` with ``line`` set on any format
+    violation, including non-ASCII bytes, paths that are not valid
+    NFC UTF-8, and missing strict UTF-8 byte ordering.
+    """
+    if len(data) > _MANIFEST_TEXT_LIMIT:
+        raise ManifestError("malformed_manifest", "manifest is too large")
+    try:
+        data.decode("ascii")
+    except UnicodeDecodeError:
+        # Pinpoint the first non-ASCII byte's line for the caller.
+        line = data.count(b"\n", 0, _first_non_ascii(data)) + 1
+        raise ManifestError(
+            "malformed_manifest", "manifest is not ASCII text", line
+        )
+    # A zero-length declaration is legal: it covers no members.
+    if data == b"":
+        return []
+    if not data.endswith(b"\n"):
+        raise ManifestError(
+            "malformed_manifest",
+            "manifest must end with a newline",
+            data.count(b"\n") + 1,
+        )
+
+    rows: list[tuple[bytes, int, bytes]] = []
+    prev_path: bytes | None = None
+    # split(b"\n") of a newline-terminated blob yields a trailing "" that
+    # we drop; every other piece is exactly one declaration line.
+    for line_no, line in enumerate(data.split(b"\n")[:-1], start=1):
+        match = _MANIFEST_LINE.fullmatch(line + b"\n")
+        if not match:
+            raise ManifestError(
+                "malformed_manifest",
+                "expected '<sha256>\t<size>\t<path>' with trailing newline",
+                line_no,
+            )
+        digest_hex, size_text, path = match.groups()
+        if not path:
+            raise ManifestError(
+                "malformed_manifest", "empty path", line_no
+            )
+        # Declared paths must satisfy the same rules as member paths.
+        try:
+            validate_path(path, line_no)
+        except TarError as exc:
+            raise ManifestError(
+                "malformed_manifest", exc.message, line_no
+            ) from exc
+        if prev_path is not None and not (prev_path < path):
+            if prev_path == path:
+                raise ManifestError(
+                    "manifest_duplicate", "duplicate path in manifest", line_no
+                )
+            raise ManifestError(
+                "manifest_unsorted",
+                "paths are not sorted by UTF-8 byte order",
+                line_no,
+            )
+        prev_path = path
+        rows.append((path, int(size_text), bytes.fromhex(digest_hex.decode())))
+    return rows
+
+
+def _first_non_ascii(data: bytes) -> int:
+    for index, byte in enumerate(data):
+        if byte > 127:
+            return index
+    return len(data)
+
+
+def verify_manifest(entries: list[Entry], manifest_content: bytes,
+                    declared_digest: str | None = None) -> str:
+    """Cross-check the in-bundle declaration against parsed members.
+
+    *entries* must include the BUNDLE.MANIFEST member.  The manifest's
+    own raw-byte digest is checked first (against *declared_digest*, the
+    value of X-Bundle-Manifest-Sha256), then every row is compared
+    against archive members and vice versa.  Returns the lowercase hex
+    digest of the manifest bytes.
+    """
+    actual_digest = hashlib.sha256(manifest_content).hexdigest()
+    if declared_digest is not None and actual_digest != declared_digest:
+        raise ManifestError(
+            "manifest_digest_mismatch",
+            "manifest content digest does not match X-Bundle-Manifest-Sha256",
+        )
+
+    rows = parse_manifest(manifest_content)
+
+    by_path: dict[bytes, Entry] = {}
+    manifest_members = 0
+    for entry in entries:
+        if entry.path == MANIFEST_PATH:
+            manifest_members += 1
+            continue
+        by_path[entry.path] = entry
+
+    if manifest_members != 1:
+        # The header gate requires exactly one; a duplicate path cannot
+        # reach here (parse_archive rejects it), so this is "missing".
+        raise ManifestError(
+            "manifest_missing",
+            "bundle must contain exactly one BUNDLE.MANIFEST",
+        )
+
+    row_paths = set()
+    for path, size, digest in rows:
+        if path == MANIFEST_PATH:
+            raise ManifestError(
+                "manifest_extra",
+                "manifest must not declare itself",
+                path=MANIFEST_PATH.decode(),
+            )
+        row_paths.add(path)
+        entry = by_path.get(path)
+        if entry is None:
+            raise ManifestError(
+                "manifest_extra",
+                "declared path is not a bundle member",
+                path=path.decode("utf-8", errors="surrogateescape"),
+            )
+        if entry.size != size:
+            raise ManifestError(
+                "manifest_size_mismatch",
+                f"declared size {size} does not match member size {entry.size}",
+                path=path.decode("utf-8", errors="surrogateescape"),
+            )
+        if entry.digest != digest:
+            raise ManifestError(
+                "manifest_digest_item_mismatch",
+                "declared sha256 does not match member content",
+                path=path.decode("utf-8", errors="surrogateescape"),
+            )
+
+    member_paths = set(by_path)
+    if row_paths < member_paths:
+        missing = next(iter(member_paths - row_paths))
+        raise ManifestError(
+            "manifest_missing",
+            "bundle member is not covered by the manifest",
+            path=missing.decode("utf-8", errors="surrogateescape"),
+        )
+    if row_paths > member_paths:  # pragma: no cover - handled row by row
+        extra = next(iter(row_paths - member_paths))
+        raise ManifestError(
+            "manifest_extra",
+            "declared path is not a bundle member",
+            path=extra.decode("utf-8", errors="surrogateescape"),
+        )
+    return actual_digest
+
+
+# ---------------------------------------------------------------------------
 # Attestation
 # ---------------------------------------------------------------------------
 
 
-def attest(data: bytes) -> dict:
-    """Parse *data* and return the bytewise-sorted manifest and bundle digest."""
+def attest(data: bytes, manifest_sha256: str | None = None) -> dict:
+    """Parse *data* and return the bytewise-sorted manifest and bundle digest.
+
+    When *manifest_sha256* is given, the bundle must contain exactly one
+    ``BUNDLE.MANIFEST`` member whose raw bytes hash to that value and
+    whose declarations match every other member exactly.  The success
+    document then additionally carries ``manifestSha256``.
+    """
     entries = parse_archive(data)
     ordered = sorted(entries, key=lambda e: e.path)
+
+    manifest_digest: str | None = None
+    if manifest_sha256 is not None:
+        manifest_entries = [e for e in ordered if e.path == MANIFEST_PATH]
+        if len(manifest_entries) != 1:
+            raise ManifestError(
+                "manifest_missing",
+                "bundle must contain exactly one BUNDLE.MANIFEST",
+            )
+        # Read the declaration's raw bytes from the archive so it is
+        # verified byte-for-byte, not reconstructed from parsed members.
+        manifest_entry = manifest_entries[0]
+        start = manifest_entry.content_offset
+        manifest_content = data[start:start + manifest_entry.size]
+        manifest_digest = verify_manifest(
+            ordered, manifest_content, manifest_sha256
+        )
 
     bundle_hash = hashlib.sha256()
     manifest = []
@@ -329,7 +566,10 @@ def attest(data: bytes) -> dict:
             }
         )
 
-    return {
+    result = {
         "bundleSha256": bundle_hash.hexdigest(),
         "entries": manifest,
     }
+    if manifest_digest is not None:
+        result["manifestSha256"] = manifest_digest
+    return result

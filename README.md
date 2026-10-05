@@ -17,7 +17,7 @@ PORT=9000 python -m app.server
 docker compose up --build                # 宿主机端口默认 8080
 TAR_PORT=9000 docker compose up --build  # 自定义宿主机端口
 
-# 一次性校验（编译 + 全部代码测试 + 三类冒烟），以退出码报告结果
+# 一次性校验（编译 + 全部代码测试 + 兼容/声明/摘要/漏项等冒烟），以退出码报告结果
 docker compose run --rm verify           # 0 通过 / 1 失败
 ```
 
@@ -36,6 +36,9 @@ curl -s http://localhost:8080/health
   必须带 `Content-Length`；拒绝压缩（`Content-Encoding: gzip` 等）与
   `Transfer-Encoding: chunked`。
 - 请求体：未压缩 USTAR，**整体不超过 8 MiB**。
+- 可选请求头 `X-Bundle-Manifest-Sha256`：预登记的包内清单摘要。省略时
+  完全保持既有契约；提供时**必须恰为 64 位小写十六进制 SHA-256**，且包内
+  须恰有一个 `BUNDLE.MANIFEST` 成员。
 
 成功 `200`：
 
@@ -51,9 +54,37 @@ curl -s http://localhost:8080/health
 
 - `entries` 按路径的 **UTF-8 字节序**排序。
 - 每条给出 `path`、`size`、文件内容的 `sha256`（小写十六进制）。
+- 提供 `X-Bundle-Manifest-Sha256` 时，成功结果额外包含
+  `manifestSha256`（即包内 `BUNDLE.MANIFEST` 原始字节的小写 SHA-256，
+  与请求头一致）。
 - `bundleSha256` 计算方式（全部大端、按排序后顺序）：
   依次拼接每项的四字节路径长度（`>I`）、路径 UTF-8 字节、八字节大小（`>Q`）、
   32 字节原始 SHA-256 摘要，对拼接结果整体取 SHA-256。
+
+### `BUNDLE.MANIFEST` 声明文件
+
+仅当请求携带 `X-Bundle-Manifest-Sha256` 时启用。声明文件须为 **ASCII 文本**，
+每行以制表符分隔三项并以换行（`\n`）结束：
+
+```
+<文件内容 sha256 小写十六进制>\t<规范十进制大小>\t<路径>
+```
+
+- 摘要为恰好 64 位小写十六进制；大小为规范十进制（无符号、无空格、无前导零，
+  `0` 合法）；路径为与成员相同的合法 NFC UTF-8 相对路径。
+- 各行路径按 **UTF-8 字节序严格递增**，不得重复。
+- 声明须覆盖**除 `BUNDLE.MANIFEST` 外的全部成员**：缺项、多项（声明了不存在
+  的路径）、大小不符、内容摘要不符均拒绝；清单也不得声明自身。
+- 允许空声明（0 字节），此时包内只能有 `BUNDLE.MANIFEST` 一个成员。
+
+服务端的核对顺序固定为：
+
+1. 先对清单成员的**原始字节**取 SHA-256，与 `X-Bundle-Manifest-Sha256` 比对
+   （不重新序列化清单，防止字节级篡改被忽略）；
+2. 逐行解析格式（错误返回 1-based 行号）；
+3. 再逐项比对路径、十进制大小与内容摘要，并做双向集合核对。
+
+任一步失败都不返回部分清单。
 
 失败响应一律不返回任何部分清单：
 
@@ -97,14 +128,25 @@ curl -s http://localhost:8080/health
 | `trailing_data`      | 结束标记之后存在非零数据 |
 | `invalid_path`       | 非 UTF-8、非 NFC、绝对路径、点段、反斜杠、控制字符、空段 |
 | `duplicate_path`     | 路径重复（含 prefix 拼接歧义） |
+| `malformed_manifest` | 声明非 ASCII、行格式错误、空路径、非法路径或未以换行结束（带 `line`） |
+| `manifest_unsorted`  | 声明行未按 UTF-8 字节序递增（带 `line`） |
+| `manifest_duplicate` | 声明中路径重复（带 `line`），HTTP 422 |
+| `manifest_digest_mismatch` | 清单原始字节摘要与 `X-Bundle-Manifest-Sha256` 不符，HTTP 409 |
+| `manifest_digest_item_mismatch` | 某项声明摘要与实际内容不符（带 `path`），HTTP 409 |
+| `manifest_size_mismatch` | 某项声明大小与实际不符（带 `path`），HTTP 409 |
+| `manifest_missing`   | 缺少/多于一个 `BUNDLE.MANIFEST`，或有成员未被声明覆盖（带 `path`），HTTP 409 |
+| `manifest_extra`     | 声明了包内不存在的路径或清单声明自身（带 `path`），HTTP 409 |
 | `unsupported_media_type` | Content-Type/Content-Encoding 不符 |
 | `bad_request` / `length_required` / `truncated`（传输层） | 请求分帧问题 |
+
+清单类错误一律返回 HTTP 422（格式问题，带 `line`）或 409（缺项/多项/属性
+冲突，带 `path`）。
 
 ## 测试
 
 ```bash
 pip install pytest
-python -m pytest -q        # 58 个用例
+python -m pytest -q        # 98 个用例
 python scripts/verify.py   # 与 Compose verify 服务相同的一次性校验
 ```
 

@@ -8,9 +8,10 @@ import threading
 
 import pytest
 
-from app.server import ATTEST_PATH, HEALTH_PATH, build_server
+from app.server import ATTEST_PATH, HEALTH_PATH, MANIFEST_HEADER, build_server
 
 from .tarbuilder import archive, file_member
+from .manifest_helpers import bundle_with_manifest, manifest_text
 
 
 @pytest.fixture()
@@ -168,3 +169,133 @@ def test_error_never_contains_partial_manifest(server):
     doc = json.loads(body)
     assert "entries" not in doc
     assert doc["error"]["category"] == "trailing_data"
+
+
+# --------------------------------------------------------------------------
+# BUNDLE.MANIFEST pre-registration
+# --------------------------------------------------------------------------
+
+
+def test_attest_without_manifest_header_stays_compatible(server):
+    payload = archive(file_member(b"f", b"x"))
+    resp, body = post_tar(*server, payload)
+    assert resp.status == 200, body
+    doc = json.loads(body)
+    assert "manifestSha256" not in doc
+
+
+def test_valid_manifest_header_passes_and_echoes_digest(server):
+    payload, declared = bundle_with_manifest(
+        {b"dir/a.bin": b"hello", b"readme.txt": b"world\n"}
+    )
+    resp, body = post_tar(
+        *server, payload,
+        extra_headers={MANIFEST_HEADER: declared},
+    )
+    assert resp.status == 200, body
+    doc = json.loads(body)
+    assert doc["manifestSha256"] == declared
+    assert [e["path"] for e in doc["entries"]] == [
+        "BUNDLE.MANIFEST", "dir/a.bin", "readme.txt",
+    ]
+
+
+def test_manifest_member_accepted_without_header(server):
+    # Merely shipping the file activates nothing; the legacy contract
+    # stays byte-identical.
+    payload, _ = bundle_with_manifest({b"a": b"x"})
+    resp, body = post_tar(*server, payload)
+    assert resp.status == 200, body
+    assert "manifestSha256" not in json.loads(body)
+
+
+def test_malformed_manifest_header_rejected(server):
+    payload, _ = bundle_with_manifest({b"a": b"x"})
+    for bad in ("", "0" * 64 + " ", "A" * 64, "0" * 63,
+                "0x" + "0" * 62):
+        resp, body = post_tar(
+            *server, payload,
+            extra_headers={MANIFEST_HEADER: bad},
+        )
+        assert resp.status == 400, (bad, body)
+        assert json.loads(body)["error"]["category"] == "bad_request", bad
+
+
+def test_duplicate_manifest_header_rejected(server):
+    host, port = server
+    conn = http.client.HTTPConnection(host, port, timeout=10)
+    conn.putrequest("POST", ATTEST_PATH)
+    conn.putheader("Content-Type", "application/x-tar")
+    conn.putheader("Content-Length", "0")
+    conn.putheader(MANIFEST_HEADER, "0" * 64)
+    conn.putheader(MANIFEST_HEADER, "1" * 64)
+    conn.endheaders()
+    resp = conn.getresponse()
+    body = resp.read()
+    conn.close()
+    assert resp.status == 400
+    assert json.loads(body)["error"]["category"] == "bad_request"
+
+
+def test_manifest_digest_conflict_returns_409(server):
+    payload, _ = bundle_with_manifest({b"a": b"x"})
+    resp, body = post_tar(
+        *server, payload,
+        extra_headers={MANIFEST_HEADER: "0" * 64},
+    )
+    assert resp.status == 409, body
+    err = json.loads(body)["error"]
+    assert err["category"] == "manifest_digest_mismatch"
+    assert "entries" not in json.loads(body)
+
+
+def test_item_digest_conflict_returns_409_with_path(server):
+    files = {b"a": b"actual"}
+    text = manifest_text(
+        {b"a": (hashlib.sha256(b"declared").digest(), len(b"actual"))}
+    )
+    payload, declared = bundle_with_manifest(files, text=text)
+    resp, body = post_tar(
+        *server, payload,
+        extra_headers={MANIFEST_HEADER: declared},
+    )
+    assert resp.status == 409, body
+    err = json.loads(body)["error"]
+    assert err["category"] == "manifest_digest_item_mismatch"
+    assert err["path"] == "a"
+
+
+def test_malformed_manifest_text_returns_422_with_line(server):
+    text = (manifest_text({b"a": b"x"}) + b"broken line\n")
+    payload = archive(
+        file_member(b"a", b"x"),
+        file_member(b"BUNDLE.MANIFEST", text),
+    )
+    declared = hashlib.sha256(text).hexdigest()
+    resp, body = post_tar(
+        *server, payload,
+        extra_headers={MANIFEST_HEADER: declared},
+    )
+    assert resp.status == 422, body
+    err = json.loads(body)["error"]
+    assert err["category"] == "malformed_manifest"
+    assert err["line"] == 2
+
+
+def test_manifest_omission_conflict_returns_409(server):
+    # Archive member missing from the declaration.
+    text = manifest_text({b"a": b"x"})
+    payload = archive(
+        file_member(b"a", b"x"),
+        file_member(b"b", b"y"),
+        file_member(b"BUNDLE.MANIFEST", text),
+    )
+    declared = hashlib.sha256(text).hexdigest()
+    resp, body = post_tar(
+        *server, payload,
+        extra_headers={MANIFEST_HEADER: declared},
+    )
+    assert resp.status == 409, body
+    err = json.loads(body)["error"]
+    assert err["category"] == "manifest_missing"
+    assert err["path"] == "b"
